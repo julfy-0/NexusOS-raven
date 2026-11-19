@@ -1,0 +1,70 @@
+#ifndef NEXUSOS_PAGING_H
+#define NEXUSOS_PAGING_H
+
+/* NexusOS: свои page tables (PML4/PDPT/PD), Milestone 0.4 "memoria".
+ *
+ * До этого модуля ядро жило на identity-map, оставленной UEFI firmware
+ * (CR3 указывал на таблицы, построенные прошивкой ДО ExitBootServices).
+ * Это работало, но это чужая память, чужой формат, и на неё нельзя
+ * полагаться (прошивка не обязана оставлять её в каком-то конкретном
+ * виде, это просто повезло, что она вообще совместима с long mode).
+ *
+ * paging_init() строит СВОИ таблицы и переключает CR3 на них. Схема
+ * пока та же по смыслу — identity map (виртуальный адрес == физический),
+ * higher-half kernel — отдельный будущий шаг (см. ROADMAP, Milestone 0.4).
+ * Гранулярность — 2 MiB страницы (PS-бит в PD), не 4 KiB: страниц
+ * меньше, таблиц меньше, а честной причины дробить мельче пока нет
+ * (свопинга/защиты отдельных 4 KiB страниц ещё не существует).
+ *
+ * PAE/long mode уже включены прошивкой ДО прыжка в kmain — мы не
+ * настраиваем их заново, только строим новые таблицы и делаем `mov cr3`. */
+
+#include "boot_info.h"
+
+/* Строит identity-map по EFI memory map из boot_info (+ framebuffer,
+ * на случай если он окажется вне уже покрытого диапазона) и переключает
+ * CR3 на свои таблицы. Вызывать один раз из kmain(), после idt_init()
+ * (чтобы page fault во время самой настройки хотя бы красиво
+ * запаниковал, а не тройной fault). */
+void paging_init(nexus_boot_info_t *bi);
+
+/* Физический адрес PML4 (текущее значение CR3) — для диагностики
+ * (шелл-команда meminfo и т.п.). */
+uint64_t paging_get_cr3(void);
+
+/* 1 if the framebuffer is mapped write-combining (writes reach the screen
+ * without explicit cache flushes), 0 if it is still write-back. */
+int paging_fb_is_wc(void);
+
+/* Address-space primitives. Each process receives a private copy of the
+ * current kernel page-table hierarchy; user mappings are then added only to
+ * that hierarchy. */
+uint64_t paging_kernel_cr3(void);
+uint64_t paging_create_address_space(void);
+void paging_destroy_address_space(uint64_t cr3);
+int paging_switch_cr3(uint64_t cr3);
+int paging_map_page_in_cr3(uint64_t cr3, uint64_t virtual_address, uint64_t physical_address, uint64_t flags);
+int paging_unmap_page_in_cr3(uint64_t cr3, uint64_t virtual_address);
+uint64_t paging_virt_to_phys_in_cr3(uint64_t cr3, uint64_t virtual_address);
+
+/* Сколько GiB покрыто "базовой" (всегда присутствующей) identity-map
+ * низкой памяти, не считая точечных доп. регионов (framebuffer и то,
+ * что реально было в EFI memory map выше этого порога). Для диагностики. */
+uint64_t paging_base_identity_gib(void);
+
+/* Домапливает диапазон [start, end) уже ПОСЛЕ paging_init() и переключения
+ * CR3 — для MMIO BAR'ов (например xHCI), которые лежат выше базового
+ * идентити-диапазона и которых не было в EFI memory map/framebuffer на
+ * момент paging_init(). Пишет прямо в уже активные PDPT/PD (CR3
+ * перезагружать не нужно: записи читаются процессором при каждом обходе
+ * таблиц, а на "not present" TLB ничего не кэширует). Округляет наружу до
+ * 2 MiB, как и остальная identity-map. */
+void paging_map_region(uint64_t start, uint64_t end);
+
+/* 4 KiB mappings used by the Virtual Memory Manager. These APIs allocate
+ * page-table pages from PMM and update the active address space. */
+int paging_map_page(uint64_t virtual_address, uint64_t physical_address, uint64_t flags);
+int paging_unmap_page(uint64_t virtual_address);
+uint64_t paging_virt_to_phys(uint64_t virtual_address);
+
+#endif

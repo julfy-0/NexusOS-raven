@@ -1,0 +1,27 @@
+# Build artifacts & binaries
+build/
+*.o
+*.a
+*.so
+*.bin
+*.elf
+*.img
+*.iso
+
+# Logs & temp output
+*.log
+build_output.txt
+build_p6p.log
+stock_drivers_list.txt
+
+# Archives
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+
+# OS / Editor files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

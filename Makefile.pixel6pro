@@ -1,0 +1,59 @@
+# NexusOS -> Pixel 6 Pro (gs101, aarch64). Этап 1: загрузка из boot.img, лог через ramoops.
+#   make -f Makefile.pixel6pro            # build/pixel6pro/boot.img
+CROSS ?= aarch64-linux-gnu-
+CC := $(CROSS)gcc
+LD := $(CROSS)ld
+OBJCOPY := $(CROSS)objcopy
+B := build/pixel6pro
+ARCH := kernel/arch/aarch64
+GPU := kernel/drivers/gpu/gs101
+INPUT := kernel/drivers/input/gs101
+FS := kernel/fs
+
+CFLAGS := $(EXTRA) -ffreestanding -fno-builtin -fno-stack-protector -fPIE -fno-ident \
+          -mstrict-align -mgeneral-regs-only -mcmodel=small \
+          -fno-tree-loop-distribute-patterns -Wall -Wextra -O2 \
+          -Iinclude/nexus -I$(ARCH) -I$(GPU) -I$(INPUT) -I$(FS) \
+          -Iinclude/nexus/arch/aarch64/gs101
+LDFLAGS := -nostdlib -shared -Bsymbolic -z norelro --no-dynamic-linker -T $(ARCH)/linker.ld
+
+C_SRCS := $(wildcard $(ARCH)/*.c)
+GPU_SRCS := $(wildcard $(GPU)/*.c)
+INPUT_SRCS := $(wildcard $(INPUT)/*.c)
+FS_SRCS := $(FS)/gpt.c
+OBJS := $(B)/entry.o $(patsubst $(ARCH)/%.c,$(B)/%.o,$(C_SRCS)) $(patsubst $(GPU)/%.c,$(B)/gpu_%.o,$(GPU_SRCS)) $(patsubst $(INPUT)/%.c,$(B)/input_%.o,$(INPUT_SRCS)) $(patsubst $(FS)/%.c,$(B)/fs_%.o,$(FS_SRCS))
+
+.PHONY: all clean
+all: $(B)/boot.img
+
+$(B)/entry.o: $(ARCH)/entry.S
+	@mkdir -p $(B)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(B)/%.o: $(ARCH)/%.c $(wildcard $(ARCH)/*.h)
+	@mkdir -p $(B)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(B)/gpu_%.o: $(GPU)/%.c $(wildcard $(GPU)/*.h) $(wildcard $(ARCH)/*.h)
+	@mkdir -p $(B)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(B)/input_%.o: $(INPUT)/%.c $(wildcard $(INPUT)/*.h) $(wildcard $(GPU)/*.h) $(wildcard $(ARCH)/*.h)
+	@mkdir -p $(B)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(B)/fs_%.o: $(FS)/%.c $(wildcard $(FS)/*.h) $(wildcard $(ARCH)/*.h)
+	@mkdir -p $(B)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(B)/kernel.elf: $(OBJS) $(ARCH)/linker.ld
+	$(LD) $(LDFLAGS) -o $@ $(OBJS)
+
+$(B)/Image: $(B)/kernel.elf
+	$(OBJCOPY) -O binary --strip-all $< $@
+
+$(B)/boot.img: $(B)/Image tools/mkbootimg_pixel.py
+	python3 tools/mkbootimg_pixel.py $(B)/Image $@
+
+clean:
+	rm -rf $(B)

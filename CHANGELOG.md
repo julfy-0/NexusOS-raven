@@ -1,0 +1,993 @@
+## NexusOS 0.7 — High-refresh EDID detection
+
+- UEFI now copies up to 512 bytes of EDID instead of only the base block.
+- EDID parsing scans valid CTA-861 extension detailed timings, so 120/144 Hz timings advertised outside the base block can be detected.
+- `gpuinfo` labels the reported capability as `EDID max` to distinguish it from the active scan-out refresh.
+- Actual refresh switching remains unavailable on the GOP-only path; a GPU-specific modesetting backend is required. No FPS cap is presented as a substitute for monitor Hz.
+
+## NexusOS 0.7 — NVIDIA RTX driver, real refresh status
+
+### Added
+- `drivers/graphics/gpu/nvidia/nvidia_rtx.*`: NVIDIA **RTX-only** driver layer (Turing RTX, Ampere, Ada Lovelace, Blackwell). It scans every PCI display/3D controller (so a hybrid laptop's dGPU is found too), enables PCI memory decode, maps BAR0 and confirms the generation from the GPU's own chip-ID register (`PMC_BOOT_0`/`BOOT_42`, read-only). GTX 16/10, GT, MX, Hopper and other non-RTX parts are never claimed and stay on the UEFI GOP framebuffer.
+- `drivers/graphics/display`: display status API that keeps **refresh rate (Hz)** and the GUI **frame limit (FPS cap)** apart: active refresh (EDID timing the firmware drives), the panel's maximum refresh, whether Hz switching is available, and `display_set_refresh_hz()` which reports honestly (`DISPLAY_ERR_UNSUPPORTED`) instead of pretending.
+- `edid_max_refresh_hz()`: panel maximum from the EDID Display Range Limits descriptor (incl. the 1.4 +255 offsets) and detailed timings.
+- Settings > Display shows the real refresh, the panel maximum ("Panel supports up to 144 Hz, firmware drives 60"), the claimed RTX GPU, and states that the FPS cap does not change monitor Hz. `gpuinfo` prints the same data plus the framebuffer cache mode.
+
+### Removed
+- The old `rtx4060.c`: it wrote invented MMIO registers (`BAR0+0x100000`...), reported a fake 640x480 hardware mode, matched only device ID 0x2684 (that is an RTX 4090; the RTX 4060 is 0x2882) and read an uninitialised BAR descriptor.
+
+### Fixed
+- NVIDIA device-name table: 0x2184 is a GTX 1660, not an RTX 2060; 0x2204 is an RTX 3090; several other RTX IDs were wrong. Unknown RTX IDs now show their generation instead of a guessed name.
+
+### Not implemented (hardware reality)
+- Changing the monitor refresh rate and any GPU acceleration (2D/3D engines, NVDEC/NVENC video decode/encode) on Turing and newer require NVIDIA's signed GSP firmware and resource manager. See `docs/NVIDIA_RTX.md`.
+
+## NexusOS 0.7 — Power, real refresh rate, lock screen
+
+### Added
+- Real ACPI power management (`system/services/power`): shutdown via FADT PM1 control blocks + DSDT `\_S5_` (works on real hardware, not only QEMU), with fallbacks for QEMU/Bochs/VirtualBox. Reboot via ACPI reset register, 8042, port 0xCF9, then triple fault. Tables are parsed lazily on first use.
+- GUI Start menu: working **Restart**, **Shut down** and new **Lock** buttons (they used to only set a state flag).
+- Lock screen with a large clock and date; shown when the desktop starts, from the Start menu, or with the terminal command `lock`. Any key or click unlocks.
+- The bootloader now passes the active display EDID (`boot_info.edid`); `drivers/graphics/edid` derives the panel refresh rate from it and makes it the default frame limit (added to the Hz list if missing).
+- `drivers/timer/tsc`: TSC calibrated against PIT channel 2. Frame pacing uses the TSC (sub-microsecond) instead of the 1 ms PIT counter, and the main loop polls instead of `hlt` when a frame is due within 2 ms, so 144/240 Hz limits are no longer rounded to the 1 kHz tick.
+- FPS counter is hidden by default; toggle it in Settings > Display, or with `fps on|off|toggle` (the overlay is drawn top-right).
+- GUI terminal: `ps`/`apps`, `kill <app|pid|all|gui>`, `exit gui` (leave the desktop for the command line), `lock`, `reboot`, `shutdown`.
+- Shell: `kill <pid>`.
+
+### Changed
+- `shutdown`/`reboot` shell commands use the power service.
+- Settings > Display shows the monitor refresh rate and the FPS toggle; the Hz buttons are narrower to fit the extra panel value.
+
+## NexusOS 0.7 — Desktop personalisation
+
+### Added
+- Settings > Display: selectable frame limit (30/60/75/120/144/240 Hz, software pacing) with a live FPS counter; Left/Right keys change it.
+- Settings > Personalize: wallpaper picker (built-in + `assets/wallpapers/wall1..5.png`, converted by `tools/make_wallpaper.py`), taskbar Solid/Glass, blur strength Low/Medium/High, 6 accent colours.
+- Translucent taskbar and Start menu with real two-pass box blur of the content underneath.
+- Bilinear "cover" wallpaper scaling (centre crop) for any screen aspect ratio.
+- New apps: Calculator (fixed point, 3 decimals, mouse + keyboard) and Notes (saves `note.txt` to the current VFS directory).
+- GUI terminal commands: `hz`, `wall`, `accent`, `blur`, `fps`, `date`, `files`, `settings`, `calc`, `notes`.
+
+## NexusOS 0.7 — Input & Cursor fixes
+
+### Added
+- Custom mouse cursor from an image: `assets/cursors/cursor.png` + `hotspot.txt` -> `tools/make_cursor.py` -> embedded `cursor.bin` (alpha-blended, up to 64x64).
+- Framebuffer is mapped write-combining (PAT entry 1) so partial updates reach the screen; explicit `clflush` fallback when PAT is unavailable.
+
+### Fixed
+- IRQ2 (PIC cascade) was masked, so IRQ12 (PS/2 mouse) could never be delivered.
+- Floating i8042 status (0xFF on USB-only machines) was read as mouse data: phantom packets with all buttons held threw the pointer into a corner. The i8042 is now only polled when a PS/2 mouse really answered.
+- The IRQ1 handler consumed auxiliary (mouse) bytes as keyboard scancodes.
+- PS/2 keyboard init gave up on the first failed command; it now retries with RESET, sets scancode set 2 + fastest typematic, and no longer aborts boot when the device does not ACK.
+
+## NexusOS 0.7 — Graphics & Input Performance
+
+### Added
+- 60 Hz frame pacing for the desktop: scene redraws are coalesced and rendered at most every 16.667 ms.
+- Pre-scaled wallpaper cache (scaling is done once instead of per-pixel on every frame); resolutions up to 8K.
+- `mouse_poll_idle()` fallback that drains the i8042 if an IRQ12 was ever lost.
+
+### Changed
+- PIT runs at 1000 Hz (was 100 Hz): finer frame timing and xHCI/USB polled every millisecond.
+- `memcpy`/`memset`/`memmove` use `rep movsq/stosq` instead of byte loops.
+- Pointer is a screen overlay: moving the mouse restores/draws an 8x12 rectangle instead of redrawing and copying the whole frame.
+- Event queue capacity 256 -> 2048, drain budget 128 -> 512 (mouse bytes were dropped under load).
+- PS/2 mouse: retried init with RESET fallback, 200 Hz report rate, 9-bit deltas with saturation on overflow (packets were dropped), stale partial packets are resynchronised.
+- Glyph drawing fast path for 1x text.
+
+### Fixed
+- USB mouse Y axis was inverted (HID +Y is down; the PS/2 sign convention was applied).
+- Terminal/Files/Settings/Search views never presented their frame to the screen.
+
+## NexusOS 0.7 — Build 002 — Native Capability Foundation
+
+### Added
+- Native per-process capability bitmap.
+- Capability inheritance when creating child processes.
+- Stable capability names for diagnostics and future policy tooling.
+- Append-only `GETCAPS`, `HAS_CAP` and `DROP_CAP` syscalls.
+- Userspace Nexus Runtime capability wrappers.
+
+### Security
+- Filesystem read/write, process spawning/control, memory mapping, Nexus Runtime and Nexus IPC syscall families are capability-gated.
+- Capability granting remains kernel-owned.
+- A userspace process may voluntarily drop a capability, but cannot grant itself a new one.
+
+### Notes
+- Public version remains **NexusOS 0.7**.
+- Internal development build: **Build 002**.
+- Existing default userspace capabilities preserve current 0.7 functionality while establishing the native security boundary for future restricted applications.
+
+## NexusOS 0.7 — Service and IPC Dependency Manager
+
+### Added
+- Native dependency metadata for built-in Nexus services and drivers.
+- Recursive dependency resolution before module initialization.
+- Dependency-cycle and missing-dependency detection.
+- Dependency state inspection APIs for diagnostics.
+
+### Runtime
+- The `runtime` service now declares an explicit dependency on `ipc`.
+- Service startup no longer depends only on numeric module priority.
+
+### Notes
+- Public versioning uses `0.7`; internal development builds may use separate Build numbers.
+- Existing Nexus Channel IPC, private CR3 isolation, watchdog and Critical OS Stop paths are preserved.
+
+## NexusOS 0.7 — Native Runtime Context
+
+### Userspace
+- Added `nexus_runtime_context_t` for reusable Native Runtime state.
+- Added runtime context open and refresh operations.
+- Added process, address-space, ABI, channel-limit and message-limit accessors.
+- Added multi-bit runtime feature checks.
+- Added a dedicated `make user-runtime` build target.
+
+### ABI
+- Existing syscall numbers are unchanged.
+- Runtime ABI version remains `1`.
+- The new API is a userspace convenience layer over the existing runtime information syscall.
+
+### Stability
+- Failed runtime queries invalidate the context instead of exposing partially populated state.
+- No kernel IRQ path or scheduler path was changed.
+
+### Notes
+- This is an incremental 0.7 userspace runtime expansion; it does not claim completion of the full 700+ feature / 2000+ fix development target.
+
+## NexusOS 0.7 — Native Userspace Runtime Foundation
+
+### Stability
+- Commands are now deferred out of the keyboard/xHCI input event-drain path, preventing command execution from blocking input processing.
+
+### Added
+- Public, append-only Nexus syscall ABI header.
+- Nexus Runtime ABI and runtime feature descriptor.
+- Built-in `ipc` and `runtime` service modules.
+- Per-process Nexus Channel handles.
+- Fixed-size cross-process IPC channels.
+- Bounded 256-byte messages with deterministic queue depth.
+- Runtime information syscall and userspace runtime wrapper library.
+- Channel create, close, send, receive and poll syscalls.
+
+### Userspace
+- Added the first native Nexus Runtime boundary for Ring-3 applications.
+- Applications can discover their runtime ABI, process identity and address-space contract.
+- Applications can communicate through Nexus Channels without depending on Unix pipe semantics.
+
+### Process
+- IPC endpoints are cleaned up when a process terminates.
+- Per-process channel ownership is cleared during safe reaping.
+
+### Stability
+- Existing private CR3 isolation, syscall validation, watchdog and Critical OS Stop paths are preserved.
+
+### Notes
+- 0.7 begins the Nexus Native Architecture milestone.
+- Linux userland concepts are not used as the primary userspace abstraction.
+
+## NexusOS 0.6.6 — Kernel Heap Integrity and Stability
+
+### Added
+- Kernel heap integrity validation.
+- Heap metadata consistency checks.
+- Heap corruption counter for diagnostics.
+
+### Stability
+- Heap validation runs during normal kernel execution.
+- Heap allocation/free paths validate allocator metadata before mutation.
+- Detected kernel heap corruption escalates to Critical OS Stop instead of continuing with potentially corrupted state.
+
+### Notes
+- NexusOS 0.6.5 version consistency work is preserved.
+- Scheduler watchdog and freeze diagnostics remain enabled.
+- The 0.6.x line remains focused on stability and hardening before the 0.7 feature program.
+
+## NexusOS 0.6.5 — QEMU Window Compatibility
+
+### Changed
+- Restored the QEMU GTK window backend as the default display backend.
+- Disabled host-side OpenGL in the default GTK backend to avoid Mesa/Zink/Wayland initialization failures under WSL.
+- `NEXUS_QEMU_DISPLAY` remains available for custom QEMU display backends.
+
+### Notes
+- NexusOS version remains 0.6.5 - Enstein.
+- This change affects the host-side QEMU window only; it does not change the NexusOS framebuffer architecture.
+
+## NexusOS 0.6.5 — Version Consistency and Build Stability
+
+### Added
+- Unified 0.6.5 version metadata across kernel, build system and documentation.
+- Build/version consistency checks for release artifacts.
+- QEMU display backend override remains configurable through `NEXUS_QEMU_DISPLAY`.
+
+### Build System
+- Release ISO and image names now follow the single NexusOS version source.
+- Build output uses the current NexusOS version consistently.
+- Version drift between kernel headers, Makefile, README and status documentation is corrected.
+
+### Stability
+- Preserved the 0.6.x watchdog and bounded event-processing changes.
+- Preserved Critical OS Stop handling for unrecoverable kernel-level failures.
+- Preserved the safer QEMU `sdl,gl=off` default for host environments with broken EGL/Zink paths.
+
+### Notes
+- NexusOS version is now **0.6.5 - Enstein**.
+- The 0.6.x line remains focused on stability, diagnostics and platform hardening before the 0.7 feature program.
+
+## NexusOS 0.6.4 — Scheduler Introspection Syscalls
+
+### Added
+- Additional Ring-3 system calls for scheduler and thread-state inspection.
+
+### Syscall
+- `GETQUANTUM_EXPIRATIONS`
+- `GETCONTEXT_SWITCHES`
+- `GETTIMER_HZ`
+- `GETQUANTUM_TICKS`
+- `GETTHREAD_COUNT`
+- `GETMAX_THREADS`
+- `GETREADY_COUNT`
+- `GETSLEEPING_COUNT`
+- `GETTHREAD_SWITCHES`
+- `GETTHREAD_RUNTIME`
+
+### Scheduler
+- Userspace can inspect global scheduler activity without accessing kernel pointers.
+- Thread switch and runtime counters are exposed through validated scalar syscalls.
+- Timer and quantum configuration can be queried by userspace.
+
+### Notes
+- Stability and freeze diagnostics from NexusOS 0.6.1 are preserved.
+- Expanded syscall ABI from NexusOS 0.6.2 and 0.6.3 is preserved.
+- The 0.6.x line remains focused on stability, observability and hardware compatibility before the 0.7 feature program.
+
+## NexusOS 0.6.3 — Expanded System Introspection Syscalls
+
+### Added
+- Additional Ring-3 system calls for process, ABI, memory and file-descriptor introspection.
+
+### Syscall
+- 
+- 
+- 
+- 
+- 
+- 
+- 
+- 
+- 
+- 
+- 
+- 
+
+### Userspace
+- Processes can query their current scheduler thread ID.
+- Processes can query the running NexusOS version and architecture.
+- Processes can inspect their userspace memory boundaries and heap bounds.
+- File-descriptor type, offset and flags can be queried without exposing kernel pointers.
+
+### Notes
+- Stability and freeze diagnostics from NexusOS 0.6.1 are preserved.
+- Expanded syscall ABI from NexusOS 0.6.2 is preserved.
+- The 0.6.x line remains focused on stability and platform hardening before the 0.7 feature program.
+
+## NexusOS 0.6.2 — Expanded Userspace Syscall ABI
+
+### Added
+- Additional userspace system calls for process, environment, timing, memory and descriptor inspection.
+
+### Syscall
+- `GETCPUTICKS`
+- `GETSTARTTICK`
+- `GETUPTIME_MS`
+- `PROCESS_COUNT`
+- `ZOMBIE_COUNT`
+- `GETENV`
+- `SETENV`
+- `UNSETENV`
+- `FD_COUNT`
+- `MEMINFO`
+
+### Process
+- Userspace can query its CPU accounting and process start tick.
+- Userspace can query total and zombie process counts.
+- Userspace can manage its own environment variables.
+- Userspace can query its active file descriptor count.
+
+### Memory
+- Added a userspace memory information syscall returning total, free, used and process memory-limit bytes.
+
+### Notes
+- Stability work from NexusOS 0.6.1 is preserved.
+- Existing syscall validation, private CR3 isolation and safe process reaping are preserved.
+- The 0.6.x line remains focused on stability and platform hardening before the 0.7 feature program.
+
+## NexusOS 0.6.2 — Stability and Freeze Diagnostics
+
+### Added
+- Kernel software watchdog for normal-context stall detection.
+- Bounded event-queue processing per main-loop pass.
+- Critical OS Stop trigger for confirmed normal-context stalls.
+
+### Scheduler
+- Watchdog time is sampled from the existing PIT tick path.
+- IRQ handlers remain capture-only.
+
+### Stability
+- Sustained keyboard/mouse event storms cannot monopolize normal context indefinitely.
+- A normal-context stall lasting longer than 3 seconds is escalated through Critical OS Stop.
+- No scheduler context switch or heavy recovery work is performed from IRQ context.
+
+### Notes
+- NexusOS 0.6.0 userspace and build-system work is preserved.
+- This release focuses on stability before the larger 0.7 feature program.
+
+## NexusOS 0.6.0 — Critical OS Stop
+
+### Added
+- Dedicated `CRITICAL OS STOP` terminal state for unrecoverable kernel conditions.
+- Separate `critical_os_stop()` API in the kernel panic subsystem.
+- Critical-stop diagnostics preserve the existing safe 30-second reboot countdown.
+- Critical stop is visually distinct from the normal `KERNEL PANIC` path.
+
+### Notes
+- `KERNEL PANIC` remains available for CPU exceptions and fatal kernel faults.
+- `CRITICAL OS STOP` is a separate fatal-state interface for subsystem-level unrecoverable failures.
+- Existing IRQ capture-only rules remain unchanged.
+
+## NexusOS 0.6.0 — Display Modes and Buffered Framebuffer
+
+### Added
+- UEFI GOP mode enumeration and largest-area mode selection.
+- GOP mode index/count exposed through boot information.
+- Kernel-side GUI backbuffer for smoother rendering.
+- Software framebuffer present path.
+- Larger render surface independent of the firmware framebuffer stride.
+
+### Display
+- NexusOS now prefers the largest framebuffer mode exposed by UEFI GOP.
+- GUI renders into a separate backbuffer when enough kernel heap memory is available.
+- Backbuffer is presented to the firmware framebuffer after drawing.
+- Existing firmware framebuffer remains the hardware scanout surface.
+
+### Notes
+- UEFI GOP does not expose refresh rate in its basic mode information, so arbitrary refresh-rate switching is not claimed by this release.
+- Exact 60/75/120/144/165/240+ Hz selection requires GPU-specific display timing/modesetting support.
+- The buffered renderer reduces tearing/flicker and decouples rendering from the physical framebuffer stride.
+
+## NexusOS 0.6.0 — Configurable Full Disk Image Size
+
+### Added
+- `build.sh --size` now controls the complete `NexusOS.img` size.
+- Minimum supported image size reduced to 192 MiB.
+- Long size suffixes `MB`, `GB`, and `TB` are accepted alongside `M`, `G`, and `T`.
+- USERDATA automatically consumes the remaining image capacity after fixed BOOT and SYSTEM partitions and GPT metadata.
+
+### Build System
+- Removed the need to specify a separate USERDATA size for normal image creation.
+- Interactive image-size prompt now defaults to 192MB.
+- Image-size validation is shared between the shell frontend and Python image builder.
+
+### Notes
+- `NexusOS.img` remains generated in the project root.
+- BOOT and SYSTEM remain 64 MiB each.
+- The requested size is the final on-disk image size, not the USERDATA partition size.
+
+
+## NexusOS 0.6.0 — Unified Build Entrypoint
+
+### Build System
+- Consolidated project shell entrypoints into a single `build.sh`.
+- `build.sh` now handles compilation, GPT/FAT32 image creation, ISO creation and optional QEMU launch.
+- Interactive prompts ask whether to create `NexusOS.img`, its size, whether to create `NexusOS.iso`, and whether to launch NexusOS.
+- Image sizes accept MB, GB and TB suffixes.
+- `NexusOS.img` remains in the project root by default.
+
+### Cleanup
+- Removed standalone `create-img.sh`, `create-iso.sh` and `run.sh` entrypoints.
+- Removed the obsolete shell image-builder wrapper; image generation now uses `tools/create_image.py` from `build.sh`.
+## NexusOS 0.6.0 — Build and Image Integration Update
+
+### Added
+- Disk-image creation is now part of `build.sh`.
+- `build.sh --image-only` can rebuild the root `NexusOS.img` without recompiling sources.
+- Total image size can be selected with `--size` using `M`, `G`, or `T`.
+- USERDATA size can be selected with `--userdata`.
+- `run.sh --rebuild --size ...` now routes image creation through `build.sh`.
+
+### Build
+- Normal `./build.sh` now builds the kernel/UEFI payload and creates the GPT/FAT32 image and standalone ISO in one command.
+- `NexusOS.img` defaults to the project root.
+- `NexusOS.iso` defaults to the project root.
+
+### Compatibility
+- `create-img.sh` remains as a compatibility wrapper for existing scripts and automation.
+- Existing image layout and verification logic are preserved.
+
+## NexusOS 0.6.0 — Root disk image launcher and configurable image sizes
+
+### Added
+- `run.sh` now uses `NexusOS.img` from the project root by default.
+- Added `--size` support to `run.sh` and `create-img.sh`.
+- Image sizes accept `M`, `G`, and `T` suffixes.
+
+### Image
+- `--size` describes the total GPT disk image size.
+- BOOT and SYSTEM partitions remain fixed at 64 MiB each.
+- Remaining capacity is assigned to USERDATA.
+- Existing `--userdata` support remains available for compatibility.
+
+### Notes
+- Existing ISO and disk-image workflows are preserved.
+- Root-image launching no longer defaults to `build/fat.img`.
+
+## NexusOS 0.6.0 — Enstein — Platform Integration Update
+
+### Added
+- Expanded Ring-3 process ABI for process metadata, file I/O, process enumeration and child execution.
+- Per-process names, priorities, CPU accounting, start-tick accounting and working-directory metadata.
+- Expanded per-process descriptor table with VFS-backed file descriptors and independent offsets.
+- Path-oriented VFS read/write/stat/directory/rename helpers.
+- `OPEN`, `READ`, `WRITE`, `CLOSE`, `SEEK`, `TELL`, `STAT`, `MKDIR`, `RMDIR`, `UNLINK`, `RENAME`, `GETCWD`, `CHDIR`, `PROCESS_ENUM`, `WAITPID`, `EXEC`, `MMAP`, `MUNMAP` and `BRK` syscall paths.
+- Scheduler-driven per-process CPU tick accounting.
+- Embedded Roboto Regular/Bold font assets and font service foundation.
+
+### Userspace
+- Child process creation through the `EXEC` syscall path.
+- Non-blocking zombie discovery through `WAITPID`.
+- Process inspection data now includes parent relationship, priority and CPU accounting.
+- Userspace memory growth and mapping foundation extends the existing private-CR3 model.
+
+### VFS
+- Descriptor-backed file offsets.
+- Path normalization for descriptor I/O.
+- RAM-VFS and mounted FAT32 integration for descriptor read/write paths.
+- File size and directory queries available through the syscall ABI.
+
+### Memory
+- User-range allocation foundation for anonymous mappings.
+- Range unmapping for individual user mappings.
+- `BRK`-style userspace heap growth/shrink foundation.
+
+### Stability
+- Existing private CR3, syscall-frame validation, zombie-safe reaping and xHCI recovery paths remain preserved.
+- No higher-half migration is introduced.
+
+### Notes
+- The 128+ feature and 200+ hardening target remains a living 0.6.0 scope.
+- Only implemented and statically validated functionality is described here as complete.
+- Runtime validation on physical USB/GPU hardware still requires the user's real machine.
+
+## NexusOS 0.5.37 — Shell Identity and Hardware Hostname
+
+### Added
+- Root/user-aware shell prompt format.
+- Motherboard manufacturer detection from SMBIOS/DMI Baseboard Information.
+- Hardware-derived shell hostname.
+
+### Shell
+- Kernel shell prompt now uses `root@<manufacturer>` or the active user identity.
+- The motherboard manufacturer is used as the hostname.
+- Existing shell command history and terminal cursor behavior are preserved.
+
+### Hardware
+- SMBIOS Type 2 Baseboard Information is parsed by the UEFI loader.
+- System manufacturer remains the fallback when baseboard manufacturer data is unavailable.
+- Firmware-owned pointers are still copied before `ExitBootServices()`.
+
+### Notes
+- Colored startup logs from NexusOS 0.5.35 are preserved.
+- USB stability changes from NexusOS 0.5.36 are preserved.
+- Higher-half kernel work remains intentionally deferred to preserve boot stability.
+
+## NexusOS 0.5.36 — USB Controller Stability and Keyboard Safety
+
+### Added
+- Safer xHCI BIOS ownership handoff.
+- xHCI controller-not-ready and start-state checks.
+- Bounded xHCI event polling budget.
+- Clear USB initialization failure reasons.
+
+### USB
+- xHCI initialization now aborts cleanly when firmware ownership cannot be transferred.
+- Host controller reset waits for Controller Not Ready (CNR) to clear.
+- xHCI startup failure no longer proceeds into an invalid controller state.
+- Multiple detected xHCI controllers continue to be tried until one initializes successfully.
+
+### Input
+- A broken USB controller can no longer monopolize normal-context event processing indefinitely.
+- PS/2 keyboard remains available when xHCI initialization fails.
+- USB HID polling is bounded per event-processing pass.
+
+### Notes
+- Multi-controller xHCI support from NexusOS 0.5.29 is preserved.
+- Driver module startup logging and colored status output remain unchanged.
+- Higher-half kernel work remains intentionally deferred to preserve boot stability.
+
+## NexusOS 0.5.35 — Colored Core and Service Startup Logs
+
+### Added
+- Colored startup status output for core services and driver modules.
+- Unified component startup format with name, type, version and status.
+- Core initialization entries for GDT, IDT, kernel address space, physical memory manager, virtual memory manager, virtual arena, allocator, event queue and scheduler.
+
+### Boot Logs
+- Component names are highlighted in cyan.
+- Successful initialization uses green `[ OK  ]`.
+- Failed initialization uses red `[ FAILED ]`.
+- Service and driver types remain visible next to their versions.
+- Boot output stays compact without verbose subsystem diagnostics.
+
+### Core Services
+- GDT and IDT startup now use the same status format as driver modules.
+- Kernel address space initialization is reported as a service.
+- Physical memory manager reports failure when no usable memory map is available.
+- Virtual memory manager, virtual arena, allocator, event queue and scheduler report independent startup status.
+
+### Notes
+- NexusOS 0.5.34 concise startup logging is preserved and extended with color.
+- Driver module loading from NexusOS 0.5.30 remains unchanged.
+- Multi-controller xHCI support from NexusOS 0.5.29 remains unchanged.
+- Higher-half kernel work remains intentionally deferred to preserve boot stability.
+
+## NexusOS 0.5.34 — Concise Driver and Service Startup Logs
+
+### Added
+- Compact startup status lines for drivers and services.
+- Module name, type, version and initialization result in one line.
+
+### Boot Logs
+- Successful components use `[ OK  ]`.
+- Failed components use `[ FAILED ]`.
+- Driver and service versions are shown directly in the startup line.
+- Redundant hardware/module diagnostics are removed from the normal boot path.
+
+### Module Manager
+- Existing priority-based module loading is preserved.
+- Driver module version information is displayed at load time.
+- Driver and service startup uses a unified status format.
+
+### Notes
+- Driver module architecture from NexusOS 0.5.30 is preserved.
+- Multi-controller xHCI support from NexusOS 0.5.29 is preserved.
+- Terminal scrollback shortcuts from NexusOS 0.5.33 are preserved.
+- Higher-half kernel work remains intentionally deferred to preserve boot stability.
+
+## NexusOS 0.5.33 — Terminal Scrollback Shortcuts
+
+### Added
+- Ctrl+Arrow terminal scrollback shortcuts.
+- One-line scrollback navigation with Ctrl+Up and Ctrl+Down.
+
+### Terminal
+- Ctrl+Up scrolls the terminal one line toward older output.
+- Ctrl+Down scrolls the terminal one line toward newer output.
+- Existing Up/Down shell history navigation remains unchanged when Ctrl is not held.
+- PageUp/PageDown continue to provide direct scrollback navigation.
+
+### Input
+- Added Ctrl modifier handling for PS/2 arrow navigation.
+- Added Ctrl modifier handling for USB HID keyboard reports.
+- Ctrl+Arrow shortcuts are ignored by the shell history handler.
+
+### Notes
+- Terminal text cursor from NexusOS 0.5.32 is preserved.
+- Driver module load status from NexusOS 0.5.31 is preserved.
+- Multi-controller xHCI support from NexusOS 0.5.29 is preserved.
+- Higher-half kernel work remains intentionally deferred to preserve boot stability.
+
+## NexusOS 0.5.32 — Terminal Text Cursor
+
+### Added
+- Blinking terminal text cursor for the NexusOS command line.
+- Cursor visibility control for shell and graphical desktop transitions.
+- PIT-driven cursor blink timing.
+
+### Terminal
+- Cursor is rendered at the active shell input position.
+- Cursor is hidden while the input line is being edited or command output is rendered.
+- Cursor is restored after shell input and history navigation.
+- Cursor is automatically removed while the graphical desktop is active.
+
+### Notes
+- Driver module logging from NexusOS 0.5.31 is preserved.
+- Multi-controller xHCI support from NexusOS 0.5.29 is preserved.
+- Higher-half kernel work remains intentionally deferred to preserve boot stability.
+
+## NexusOS 0.5.31 — Driver Module Load Status
+
+### Added
+- Per-module startup status lines for built-in kernel drivers.
+- Clear `[ OK ]` and `[ FAILED ]` load results.
+
+### Driver Logs
+- Driver initialization now prints entries such as `USB driver module [ OK ]`.
+- Each registered driver module reports its result immediately after initialization.
+- Failed modules are reported explicitly instead of only contributing to the final summary.
+
+### Module Manager
+- Module state tracking remains unchanged.
+- Existing priority-based loading order is preserved.
+- Driver module diagnostics use the common module-loading path.
+
+### Notes
+- NexusOS 0.5.30 built-in driver modules remain preserved.
+- NexusOS 0.5.29 multi-controller xHCI support remains preserved.
+- External `.mod` / `.ko` loading remains future work.
+- Higher-half kernel work remains intentionally deferred to preserve boot stability.
+
+## NexusOS 0.5.30 — Kernel Driver Modules Foundation
+
+### Added
+- Kernel module descriptor ABI for hardware drivers.
+- Built-in driver module discovery through the `.nexus_modules` linker section.
+- Priority-ordered module loading at kernel startup.
+- Runtime module state and load diagnostics.
+
+### Drivers
+- PCI, PIC, PIT, input, keyboard, mouse, network, NVMe, AHCI, USB and GPU initialization now runs through the module manager.
+- Existing driver APIs and hardware implementations remain intact.
+
+### Notes
+- 0.5.29 multi-controller xHCI support is preserved.
+- Current modules are built-in kernel modules linked into `kernel.elf`; external `.mod`/`.ko` filesystem loading remains future work.
+- Higher-half kernel work remains intentionally deferred to preserve boot stability.
+
+## NexusOS 0.5.29 — Multi-Controller xHCI and Intel USB Compatibility
+
+### Added
+- Multi-controller xHCI detection.
+- Real-hardware PCI diagnostics for xHCI controllers.
+- Active xHCI PCI BDF, vendor/device ID and BAR reporting.
+- Controller-specific xHCI initialization diagnostics.
+
+### USB
+- All PCI `0C:03:30` xHCI controllers are now enumerated.
+- NexusOS no longer stops after the first detected xHCI controller.
+- Each detected xHCI controller is attempted until one initializes successfully.
+- The generic xHCI driver can operate with standard Intel USB 3.x controllers.
+- Existing USB 2/3 root-port and HID keyboard/mouse support remains on the active xHCI backend.
+
+### PCI
+- Increased PCI device table capacity for systems with many PCI functions.
+- Improved controller discovery on real hardware with multiple USB host controllers.
+
+### Diagnostics
+- USB startup now identifies the active xHCI PCI address.
+- Vendor/device IDs are printed for the active controller.
+- xHCI initialization failures report the failed stage instead of only reporting an unsupported USB controller.
+
+### Notes
+- USB4 Host Router / Thunderbolt fabric is detected by the platform but does not use the xHCI driver; dedicated USB4 support remains future work.
+- Graphics optimizations from NexusOS 0.5.28 are preserved.
+- Userspace shell and process/file-descriptor work remain unchanged.
+- Higher-half kernel work remains intentionally deferred to preserve boot stability.
+
+## NexusOS 0.5.28 — USB Controller Compatibility and Graphics Performance
+
+### Added
+- USB controller diagnostics for real hardware.
+- PCI USB controller count reporting.
+- Explicit MMIO mapping for EHCI/OHCI controller registers.
+- Fast row-based framebuffer drawing paths.
+- Cached wallpaper scaling coordinate maps.
+- Cursor save/restore rendering without full desktop redraw on pointer movement.
+
+### USB
+- USB initialization now reports whether PCI USB host controllers were detected.
+- xHCI remains the preferred controller backend.
+- EHCI/OHCI MMIO access is explicitly mapped before controller initialization.
+- Initialization failures now expose a useful hardware-side diagnostic instead of only `No supported USB controller`.
+
+### Graphics
+- Reworked the software framebuffer renderer to avoid per-pixel function overhead in rectangle drawing.
+- Alpha rectangles use packed-channel blending directly on framebuffer words.
+- Wallpaper scaling avoids repeated division inside the inner pixel loop.
+- Mouse movement no longer forces a full desktop redraw when the desktop state is unchanged.
+
+### Notes
+- UEFI GOP remains the active display backend for stable real-hardware output.
+- Vendor-specific GPU acceleration and modesetting remain future work.
+- The higher-half kernel remains intentionally deferred to preserve boot stability.
+
+## NexusOS 0.5.24 — Per-Process File Descriptor Foundation
+
+### Added
+- Fixed-size per-process file descriptor table.
+- Standard input, output and error descriptors.
+- Descriptor type tracking for future VFS-backed handles.
+- `CLOSE` syscall for open descriptors.
+
+### Syscall
+- `WRITE` now resolves stdout/stderr through the current process descriptor table.
+- Added `NEXUS_SYS_CLOSE`.
+- Closed descriptors are rejected by subsequent descriptor-based syscalls.
+
+### Process
+- File descriptor state is initialized when a process is created.
+- File descriptor state is cleared during safe process reaping.
+- Descriptor ownership remains private to each process.
+
+### Notes
+- Userspace memory validation from NexusOS 0.5.22 is preserved.
+- Userspace console output from NexusOS 0.5.23 is preserved.
+- VFS-backed file descriptors and blocking stdin remain future work.
+
+## NexusOS 0.5.23 — Userspace Console Output
+
+### Added
+- Bounded userspace `WRITE` syscall.
+- stdout/stderr console output from Ring 3.
+
+### Syscall
+- Added `NEXUS_SYS_WRITE`.
+- Supports file descriptors `1` and `2`.
+- Returns the number of bytes written on success.
+- Limits one write operation to 4096 bytes.
+
+### Security
+- Complete userspace buffers are validated before access.
+- User data is copied through the process private CR3.
+- Zombie and invalid processes remain blocked by the existing syscall validation.
+
+### Notes
+- Syscall validation from NexusOS 0.5.21 is preserved.
+- Safe userspace memory access from NexusOS 0.5.22 is now used by a real syscall path.
+- Higher-half kernel work remains intentionally deferred to preserve boot stability.
+
+## NexusOS 0.5.22 — Safe Userspace Memory Access
+
+### Added
+- Bounded kernel-to-userspace read/write helpers.
+- Userspace range validation before cross-address-space copies.
+- Writable-page enforcement for kernel writes.
+
+### Process Memory
+- Userspace access uses the process private CR3 translation.
+- Zombie and invalid processes are rejected by the new access helpers.
+- Multi-page reads and writes are handled safely across page boundaries.
+
+### Security
+- Kernel writes into userspace require `VMM_PAGE_WRITABLE`.
+- Userspace accesses are constrained to the process-owned virtual address range.
+- Existing ELF loading remains compatible with executable non-writable mappings.
+
+### Notes
+- Syscall validation from NexusOS 0.5.21 is preserved.
+- Process lifecycle and safe reaping from NexusOS 0.5.20 are preserved.
+- Higher-half kernel work remains intentionally deferred to preserve boot stability.
+
+## NexusOS 0.5.21 — Syscall Validation and Ring-3 ABI Hardening
+
+### Added
+- Syscall caller/process ownership validation.
+- Ring-3 return-frame validation.
+- Userspace RIP mapping validation.
+- Userspace writable stack validation.
+
+### Syscalls
+- Syscalls are accepted only from scheduler-owned Ring-3 processes.
+- Syscall return selectors must match the NexusOS user ABI.
+- Ring-3 RFLAGS are validated before returning to userspace.
+- Invalid syscall contexts are rejected without modifying scheduler state.
+
+### Process Isolation
+- Syscall instruction pointers must belong to mapped executable userspace memory.
+- User stack pointers must reference mapped writable userspace memory.
+- Zombie and non-user processes cannot enter the syscall dispatcher.
+
+### Notes
+- Preserves the private CR3 process model from NexusOS 0.5.18.
+- Preserves user page-fault isolation and safe reaping from NexusOS 0.5.19/0.5.20.
+- Capture-only hardware IRQ architecture remains unchanged.
+- Higher-half kernel work remains intentionally deferred to preserve boot stability.
+
+## 0.5.20 — Enstein — Process lifecycle and safe reaping
+
+- Replaced immediate process resource destruction with a two-phase EXITED/ZOMBIE-style lifecycle using `PROCESS_ZOMBIE`.
+- `process_exit()` now records exit metadata and marks the process zombie without destroying the active private CR3.
+- Added scheduler-safe `process_reap()` to release user mappings and private page tables only after the process TCB has stopped running.
+- Prevented process slots and PIDs from being reused while a process remains a zombie.
+- Added process exit-code/reason metadata and zombie-count diagnostics API.
+- Hardened scheduler idle handling so a terminated current thread can never be revived as `THREAD_RUNNING` merely because the ready queue is empty.
+- Preserved the 0.5.19 user page-fault isolation boundary and capture-only IRQ architecture.
+
+## 0.5.19 — Enstein — User page-fault isolation
+
+- Added recoverable Ring-3 page-fault handling for scheduler-owned user processes.
+- Page-fault diagnostics now report CR2, error-code cause, access type, privilege level, RIP and RFLAGS before process termination.
+- A user page fault terminates only the faulting process instead of entering the global Kernel Panic path.
+- Process teardown is handed to the existing scheduler via `thread_exit()` after `process_exit()`.
+- Kernel-mode page faults and all other CPU exceptions remain fatal and use the existing 30-second diagnostic reboot path.
+- Preserved capture-only hardware IRQ architecture; no scheduler work was added to IRQ handlers.
+
+## 0.5.18 — Enstein — Private process address spaces
+
+- Added per-process private CR3/page-table roots.
+- Cloned the kernel paging hierarchy into each process address space.
+- Added CR3-aware map/unmap/translation APIs.
+- Added safe 2 MiB-to-4 KiB page-table splitting when a user page falls inside the identity map.
+- Scheduler now switches CR3 together with the process-owned TCB.
+- ELF loading now initializes user memory through process address translations instead of assuming the active kernel CR3 contains user mappings.
+- Preserved the existing identity-mapped kernel/hardware address space and deferred higher-half work.
+
+## 0.5.17 — Enstein — Syscall entry/return foundation
+
+- Added DPL3 `INT 0x80` syscall gate.
+- Added x86_64 syscall entry/return assembly preserving all GPRs.
+- Added user return-frame validation.
+- Enabled NOP and GETPID through the user syscall ABI.
+- Kept EXIT deferred until scheduler-owned user process termination exists.
+
+# NexusOS Changelog
+
+- Added `Files` manifest field for multiple package payloads.
+- Added strict 8.3 payload-name validation.
+- Package installation preflights every payload before mutation.
+- Multiple payloads are staged and rolled back in reverse order on failure.
+- `manifest.nxm` remains the final publication/commit point.
+
+# Changelog
+
+## 0.5.15 - Enstein
+
+- Added ELF64 x86_64 user-space loader foundation.
+- Added PT_LOAD validation, image loading and BSS zero-fill.
+- Added per-page user/writable/NX mapping flags.
+- Added fixed user stack mapping and process-owned page tracking.
+- Added `elf-run <path>` synchronous Ring-3 execution path.
+- Kept private CR3, syscall entry/return and scheduler-owned user processes for later milestones.
+
+
+## [0.5.13] — Package Installation Transaction
+
+- Added transactional package installation foundation.
+- Added manifest validation before filesystem mutation.
+- Added staged application directory creation.
+- Added bounded Entry payload installation.
+- Made `manifest.nxm` the final publication/commit point.
+- Added rollback for newly created payload/directory on failure.
+- Added immediate application rediscovery after successful installation.
+
+## [0.5.12] — Writable FAT32 Foundation
+
+NexusOS 0.5.12 adds the first bounded write path to the real FAT32/AHCI storage backend.
+
+- Added AHCI `WRITE DMA EXT` sector writes with the existing polling model.
+- Added FAT32 cluster allocation/freeing and mirrored FAT updates.
+- Added creation/overwrite of short 8.3 files.
+- Added creation of short 8.3 directories with `.` / `..` entries.
+- Added writable FAT32 routing for VFS `mkdir`, `touch`, and `write` when the mount is not read-only.
+- Switched the active `/mnt/disk0` FAT32 mount to read-write mode.
+- Kept LFN, permissions, journaling, transactions and executable loading out of this milestone.
+- Updated active version to `0.5.12 - Enstein`.
+
+## [0.5.11] — Application Discovery
+
+- Added bounded FAT32 directory enumeration for non-printing discovery.
+- Added read-only `/system/apps` and `/userdata/apps` manifest discovery.
+- Valid `manifest.nxm` files are registered with the App Manager using source classification.
+- Kept package installation, ELF loading and userspace execution out of this milestone.
+- Updated active version to `0.5.11 - Enstein`.
+
+## [0.5.10] — App Manager Foundation
+
+- Added a centralized application registry with stable application IDs.
+- Added explicit application source classification for built-in, system and userdata apps.
+- Added built-in registration helper used by NexusOS kernel initialization.
+- Added per-application lifecycle state and launch counters.
+- Added active-application tracking and explicit stop-by-ID support.
+- Kept binary execution out of the manager; ELF loading and userspace execution remain future work.
+- Updated active version to `0.5.10 - Enstein`.
+
+## [0.5.4] — Processes & Userspace Foundation
+- Consolidated process lifecycle, stable PIDs and per-process execution metadata.
+- Added user virtual-range reservation and PMM-backed 4 KiB U/S mappings with cleanup.
+- Added x86_64 TSS.RSP0 and IRETQ Ring-3 transition foundation.
+- Added kernel-side syscall dispatch foundation (NOP, GETPID, EXIT) without enabling an unsafe entry path.
+- Documented remaining limitations: private CR3, full address-space isolation, ELF loading and runnable user programs remain future work.
+
+## [0.5.4.3] — User/Kernel Memory Permissions & Address Space Activation
+- Added PMM-backed 4 KiB user mappings with U/S permissions.
+- Added per-process mapping ownership and cleanup.
+- Recorded active CR3 explicitly; private CR3 remains future work.
+
+## [0.5.4.2] — TSS & Ring-3 Transition Foundation
+
+- Completed the x86_64 GDT user selectors and TSS transition contract as an explicit userspace subsystem API.
+- Added architectural IRETQ ring-3 transition trampoline with user CS/SS selectors.
+- Added per-process user execution context metadata and TSS.RSP0 hand-off.
+- Kept page mapping, CR3 switching, ELF loading and syscalls out of this block.
+
+## [0.5.4.1] — Process & Address Space Foundation
+
+- Added fixed-size kernel process table with stable PIDs and lifecycle states.
+- Added current-process metadata and IRQ-safe process-table locking.
+- Added reserved user virtual-range metadata for future page mapping.
+- Added explicit future CR3 ownership field without switching address spaces yet.
+- Integrated process foundation into kernel startup.
+
+## [0.5.3.6] — Process-safe Event Integration
+
+- Added per-event-type sequence counters to the kernel event processor.
+- Added blocking `kernel_events_wait()` for kernel threads.
+- Added event-specific scheduler wait queues with broadcast wakeup.
+- Closed the check/enqueue race so already-processed events do not cause unnecessary sleeps.
+- Kept IRQ handlers capture-only: event wakeups and scheduler list changes stay in normal kernel context.
+- Added event sequence/waiter diagnostics to `meminfo`.
+- Updated the scheduler service thread to demonstrate event-driven blocking on keyboard events.
+- Bumped active runtime version to `0.5.3.6 - Enstein`.
+
+## [0.5.3.5] — Synchronization Primitives
+
+- Added kernel spinlocks with atomic acquire, try-lock, release and IRQ-save helpers.
+- Added ownership-aware mutexes with FIFO blocking waiters.
+- Added fixed-size scheduler wait queues and `THREAD_BLOCKED`.
+- Added blocking/wakeup scheduler APIs without performing context switches from IRQ context.
+- Mutex unlock transfers ownership directly to the first waiter before waking it.
+- Bumped active runtime version to `0.5.3.5 - Enstein`.
+
+## [0.5.3.4] — Threads & TCB
+
+- Added kernel thread control blocks (TCBs) with per-thread state, stack, ID, runtime and switch counters.
+- Added fixed-size kernel thread slots and 16 KiB per-thread stacks allocated from the kernel heap.
+- Added x86_64 callee-saved context switching (`arch_context_switch`).
+- Added thread bootstrap, `thread_create()`, `thread_yield()` and `thread_exit()`.
+- Scheduler now performs round-robin thread selection at the normal-context reschedule boundary; IRQ handlers still never switch stacks.
+- Added thread count/current TID information to `meminfo`.
+- Bumped active runtime version to `0.5.3.4 - Enstein`.
+
+## [0.5.3.2] — Timer-driven Scheduler Foundation
+
+- Added `kernel/core/scheduler/` with scheduler clock and quantum accounting.
+- Added PIT-driven scheduler ticks at the existing 100 Hz timer rate.
+- Added a 100 ms default scheduling quantum and deferred reschedule requests.
+- Added a normal-kernel-context scheduler hand-off after timer events.
+- Kept register/stack context switching out of IRQ context; TCB/context switching remains the next milestone.
+- Added scheduler diagnostics APIs for ticks, elapsed time, quantum expirations and context switches.
+- Bumped runtime version to `0.5.3.2 - Enstein`.
+
+## [0.5.3.1] — Interrupt/Event Queue
+
+- Added a fixed-size 256-event kernel ring queue.
+- Converted PIT, PS/2 keyboard and PS/2 mouse IRQ paths to capture-only handlers.
+- Deferred keyboard scancode decoding and mouse packet assembly to normal kernel context.
+- Moved xHCI polling out of IRQ0 into the kernel event loop.
+- Removed shell/GUI execution from PS/2 IRQ context.
+- Added queue push/pop/drop statistics for diagnostics.
+- Bumped runtime version to `0.5.3.1 - Enstein`.
+
+## [0.5.7] — GUI / Window System 2.0
+
+- Added native bounded window abstraction and manager.
+- Added window title, bounds, visibility and focus state.
+- Added active-window tracking and close events.
+- Added mouse title-bar dragging with screen bounds.
+- Integrated Files, Terminal, Settings and Search with shared window geometry.
+- Preserved the existing desktop renderer and deferred input architecture.
+
+## [0.5.6] — Unified Input & USB HID
+
+- Added unified input accounting for PS/2 and USB HID sources.
+- Added xHCI HID boot mouse discovery and interrupt-IN report processing.
+- Kept existing xHCI boot keyboard path and normal-context polling model.
+- Added USB mouse reports to the existing GUI coordinate/button/wheel state.
+- Updated `inputinfo` with PS/2/USB device state and event counters.
+- IRQ handlers remain capture-only; HID polling and input processing stay outside IRQ context.
+
+## [0.5.5] — Shell & I/O Foundation
+- Added robust in-place shell parser with quoting and backslash escapes.
+- Added command sequencing (`;`) and conditional sequencing (`&&`).
+- Added parser-level recognition for pipelines and redirections, keeping unsupported execution explicit.
+
+## NexusOS 0.6.0 — Clean Shell Handoff Fix
+
+### Fixed
+- Startup service status lines are now emitted before interactive shell initialization.
+- The shell no longer starts with a stale `shell service 1.0 [  OK  ]` line in the input area.
+- Userspace, syscall and GUI startup statuses are completed before the shell prompt is drawn.
+- Interactive shell initialization remains responsible for clearing the visible boot log.
+
+### Notes
+- The boot log remains available through the existing scrollback buffer, while the live shell starts on a clean screen.

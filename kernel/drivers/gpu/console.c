@@ -1,0 +1,601 @@
+/* NexusOS: простейшая текстовая консоль поверх линейного framebuffer.
+ * Никакого аппаратного ускорения — просто пишем пиксели напрямую. */
+#include <stddef.h>
+#include "console.h"
+#include "font8x16.h"
+#include "pit.h"
+
+extern void *memmove(void *dest, const void *src, unsigned long n);
+extern void *memset(void *dest, int value, unsigned long n);
+
+/* Реализация — ниже; нужны здесь, потому что console_init()/console_clear()
+ * (сразу после pack_color/put_pixel) вызывают их раньше места определения. */
+static void hist_clear_line(uint64_t logical_line);
+static void hist_new_line(void);
+static inline uint64_t hist_slot(uint64_t logical_line);
+
+static nexus_framebuffer_t *g_fb;
+static uint32_t g_fg = 0xFFFFFF;
+static uint32_t g_bg = 0x000000;
+/* Кэш уже "запакованных" под пиксельный формат экрана g_fg/g_bg — раньше
+ * pack_color() (сдвиги + маски) пересчитывался заново на каждый символ и
+ * на каждую ячейку истории, хотя цвет между вызовами почти всегда не
+ * меняется. Пересчитываем только в console_set_color()/console_init(). */
+static uint32_t g_fg_packed = 0xFFFFFF;
+static uint32_t g_bg_packed = 0x000000;
+static uint32_t g_col = 0;
+static uint32_t g_row = 0;
+static uint32_t g_cols;
+static uint32_t g_rows;
+
+/* Interactive shell cursor.  It is intentionally a framebuffer-only overlay
+ * and never runs from IRQ context. */
+static int g_cursor_enabled;
+static int g_cursor_visible;
+static uint64_t g_cursor_last_tick;
+#define CONSOLE_CURSOR_BLINK_TICKS 50ULL
+
+/* Shell stdout capture. Kept in the console layer so existing commands do not
+ * need to be rewritten just to participate in redirection and pipelines. */
+static char *g_capture_buffer;
+static uint32_t g_capture_capacity;
+static uint32_t g_capture_length;
+static int g_capture_active;
+
+/* --- Scrollback (PgUp/PgDn) ---
+ *
+ * Раньше консоль просто двигала пиксели в framebuffer (см. scroll_if_needed)
+ * и то, что уезжало за верхний край, терялось навсегда — окно в кадровый
+ * буфер, а не в какой-то более долгоживущий текст.
+ *
+ * g_history[] — кольцевой буфер СИМВОЛОВ (а не пикселей): каждая когда-либо
+ * начатая строка экрана — это одна запись, с цветом каждой ячейки (цвет мог
+ * меняться посреди строки — приглашение шелла печатается другим цветом,
+ * чем ввод). g_total_lines — монотонный счётчик "какая по счёту строка
+ * сейчас пишется" — по нему же вычисляется индекс в кольце (% SCROLLBACK_LINES)
+ * и определяется, не была ли нужная строка уже перезаписана новыми (кольцо
+ * конечного размера).
+ *
+ * MAX_COLS — верхняя граница на ширину строки в ячейках; реальная g_cols
+ * (зависит от разрешения GOP на конкретной машине) в это разумно
+ * укладывается. Само разрешение неизвестно на этапе компиляции, поэтому
+ * буфер фиксированного размера, а не по месту (тем более что kmalloc/heap
+ * пока не существует — см. docs/ROADMAP.md). */
+#define MAX_COLS 256
+#define SCROLLBACK_LINES 500
+
+typedef struct {
+    char ch;
+    uint32_t fg; /* уже "запакованный" под пиксельный формат цвет (см. pack_color) */
+    uint32_t bg;
+} console_cell_t;
+
+static console_cell_t g_history[SCROLLBACK_LINES][MAX_COLS];
+static uint64_t g_total_lines = 0;   /* номер строки, которая сейчас пишется (открыта) */
+static uint32_t g_scroll_offset = 0; /* 0 = живой вид; N = N строк назад от живого края */
+
+/* Логическая строка истории, которая сейчас показана в верхней строке экрана
+ * (экран = окно g_rows строк, начинающееся с g_screen_top). Инвариант:
+ * g_row == g_total_lines - g_screen_top. */
+static uint64_t g_screen_top = 0;
+
+/* Пакетный вывод. Внутри пакета (команда шелла, один console_print) скролл не
+ * двигает пиксели построчно: история обновляется, а экран перерисовывается
+ * ОДИН раз в console_batch_end(). */
+static int g_batch = 0;
+static int g_defer_draw = 0;
+
+static uint32_t pack_color(uint32_t rgb) {
+    uint8_t r = (rgb >> 16) & 0xFF;
+    uint8_t g = (rgb >> 8) & 0xFF;
+    uint8_t b = rgb & 0xFF;
+    /* GOP PixelRedGreenBlueReserved8BitPerColor: байт0=R, байт1=G, байт2=B
+     * (little-endian) -> 32-битное слово = R | (G<<8) | (B<<16).
+     * PixelBlueGreenRedReserved8BitPerColor: байт0=B, байт1=G, байт2=R
+     * -> слово = B | (G<<8) | (R<<16).
+     * ВАЖНО: раньше эти две ветки считали формулу друг друга (были
+     * переставлены местами) — из-за этого R и B визуально менялись
+     * местами на любом экране, где GOP реально отдаёт BGR (это самый
+     * частый случай на реальном железе и в QEMU). */
+    if (g_fb->pixel_format == NEXUS_PIXFMT_BGR) {
+        return (uint32_t)b | (uint32_t)g << 8 | (uint32_t)r << 16;
+    }
+    /* RGB и "прочее" (bitmask-форматы почти всегда тоже RGB на практике) */
+    return (uint32_t)r | (uint32_t)g << 8 | (uint32_t)b << 16;
+}
+
+static inline void put_pixel(uint32_t x, uint32_t y, uint32_t color) {
+    if (x >= g_fb->width || y >= g_fb->height) return;
+    uint32_t *row = (uint32_t *)(uintptr_t)(g_fb->base + (uint64_t)y * g_fb->pixels_per_scanline * 4);
+    row[x] = color;
+}
+
+void console_init(nexus_framebuffer_t *fb) {
+    g_fb = fb;
+    g_cols = g_fb->width / FONT_WIDTH;
+    g_rows = g_fb->height / FONT_HEIGHT;
+
+    /* pixel_format известен только теперь (пришёл в fb) - пересчитать кэш */
+    g_fg_packed = pack_color(g_fg);
+    g_bg_packed = pack_color(g_bg);
+
+    g_total_lines = 0;
+    g_screen_top = 0;
+    g_batch = 0;
+    g_defer_draw = 0;
+    g_scroll_offset = 0;
+    g_cursor_enabled = 0;
+    g_cursor_visible = 0;
+    g_cursor_last_tick = 0;
+    for (uint64_t i = 0; i < SCROLLBACK_LINES; i++) hist_clear_line(i);
+
+    console_clear();
+}
+
+void console_clear(void) {
+    console_cursor_hide();
+    /* Фиксируем в истории то, что было напечатано на текущей (ещё открытой)
+     * строке до очистки экрана, и открываем чистую строку — иначе новый
+     * текст после clear дописывался бы в ТУ ЖЕ ячейку истории поверх
+     * старого содержимого. Сама история при этом не стирается: 'clear'
+     * чистит видимый экран, а не scrollback — как в большинстве терминалов. */
+    hist_new_line();
+    g_scroll_offset = 0;
+    g_screen_top = g_total_lines;
+
+    g_col = 0;
+    g_row = 0;
+    uint32_t bg = g_bg_packed;
+    for (uint32_t y = 0; y < g_fb->height; y++) {
+        uint32_t *row = (uint32_t *)(uintptr_t)(g_fb->base + (uint64_t)y * g_fb->pixels_per_scanline * 4);
+        for (uint32_t x = 0; x < g_fb->width; x++) row[x] = bg;
+    }
+    console_cursor_show();
+}
+
+void console_set_color(uint32_t fg, uint32_t bg) {
+    g_fg = fg;
+    g_bg = bg;
+    g_fg_packed = pack_color(g_fg);
+    g_bg_packed = pack_color(g_bg);
+}
+
+/* draw_glyph_raw принимает УЖЕ запакованные цвета — нужно для перерисовки
+ * из истории (mm/scrollback), где у каждой ячейки свой сохранённый цвет,
+ * а не текущий глобальный g_fg/g_bg. draw_glyph() — обычный путь печати
+ * "прямо сейчас", просто пакует текущие глобальные цвета и зовёт raw. */
+static void draw_glyph_raw(uint32_t col, uint32_t row, char c, uint32_t fg, uint32_t bg) {
+    if (col >= g_cols || row >= g_rows) return;   /* одна проверка вместо 128 */
+
+    const uint8_t *glyph;
+    if (c >= FONT_FIRST_CHAR && c <= FONT_LAST_CHAR) {
+        glyph = font8x16[(uint8_t)c - FONT_FIRST_CHAR];
+    } else {
+        glyph = font8x16[0]; /* неизвестный символ (в т.ч. ch==0 пустой ячейки) -> пробел */
+    }
+
+    uint32_t stride = g_fb->pixels_per_scanline;
+    uint32_t *dst = (uint32_t *)(uintptr_t)g_fb->base
+                  + (uint64_t)(row * FONT_HEIGHT) * stride + col * FONT_WIDTH;
+
+    for (uint32_t y = 0; y < FONT_HEIGHT; y++) {
+        uint8_t bits = glyph[y];
+        for (uint32_t x = 0; x < FONT_WIDTH; x++) {
+            dst[x] = ((bits >> (FONT_WIDTH - 1 - x)) & 1u) ? fg : bg;
+        }
+        dst += stride;
+    }
+}
+
+static void draw_glyph(uint32_t col, uint32_t row, char c) {
+    draw_glyph_raw(col, row, c, g_fg_packed, g_bg_packed);
+}
+
+static void cursor_draw_overlay(void) {
+    if (!g_cursor_enabled || g_cursor_visible || g_fb == NULL) return;
+    if (g_row >= g_rows || g_col >= g_cols) return;
+
+    /* Classic terminal-style vertical text caret.  The underlying cell is
+     * kept in scrollback/history and restored by cursor_hide(). */
+    uint32_t px0 = g_col * FONT_WIDTH;
+    uint32_t py0 = g_row * FONT_HEIGHT;
+    uint32_t width = FONT_WIDTH >= 2 ? 2 : 1;
+    for (uint32_t y = 0; y < FONT_HEIGHT; y++) {
+        uint32_t *row = (uint32_t *)(uintptr_t)(g_fb->base +
+            (uint64_t)(py0 + y) * g_fb->pixels_per_scanline * 4);
+        for (uint32_t x = 0; x < width && px0 + x < g_fb->width; x++) {
+            row[px0 + x] = g_fg_packed;
+        }
+    }
+    g_cursor_visible = 1;
+}
+
+static void cursor_restore_cell(void) {
+    if (!g_cursor_visible || g_fb == NULL) return;
+    if (g_row >= g_rows || g_col >= g_cols) {
+        g_cursor_visible = 0;
+        return;
+    }
+
+    if (g_scroll_offset == 0) {
+        console_cell_t *cell = &g_history[hist_slot(g_total_lines)][g_col];
+        draw_glyph_raw(g_col, g_row, cell->ch, cell->fg, cell->bg);
+    } else {
+        /* The cursor is only expected in the live view.  Be conservative if
+         * a scroll operation raced with a redraw request. */
+        draw_glyph(g_col, g_row, ' ');
+    }
+    g_cursor_visible = 0;
+}
+
+void console_cursor_show(void) {
+    if (g_batch) return;   /* внутри пакета курсор рисуется в console_batch_end() */
+    if (!g_cursor_enabled) return;
+    if (g_cursor_visible) return;
+    cursor_draw_overlay();
+}
+
+void console_cursor_hide(void) {
+    cursor_restore_cell();
+}
+
+void console_cursor_enable(void) {
+    g_cursor_enabled = 1;
+    g_cursor_visible = 0;
+    g_cursor_last_tick = pit_get_ticks();
+    console_cursor_show();
+}
+
+void console_cursor_disable(void) {
+    cursor_restore_cell();
+    g_cursor_enabled = 0;
+    g_cursor_last_tick = 0;
+}
+
+void console_cursor_tick(void) {
+    if (!g_cursor_enabled || g_fb == NULL) return;
+
+    uint64_t now = pit_get_ticks();
+    if (now < g_cursor_last_tick) {
+        g_cursor_last_tick = now;
+        return;
+    }
+    if (now - g_cursor_last_tick < CONSOLE_CURSOR_BLINK_TICKS) return;
+    g_cursor_last_tick = now;
+
+    if (g_cursor_visible) {
+        cursor_restore_cell();
+    } else {
+        cursor_draw_overlay();
+    }
+}
+
+/* --- scrollback: запись в историю и перерисовка из неё --- */
+
+static inline uint64_t hist_slot(uint64_t logical_line) {
+    return logical_line % SCROLLBACK_LINES;
+}
+
+/* Затирает строку в истории пробелами текущим цветом фона — вызывается,
+ * когда строка только начинается, чтобы после переиспользования кольца не
+ * показывать мусор с многих оборотов назад. */
+static void hist_clear_line(uint64_t logical_line) {
+    console_cell_t *row = g_history[hist_slot(logical_line)];
+    for (uint32_t x = 0; x < MAX_COLS; x++) {
+        row[x].ch = ' ';
+        row[x].fg = g_fg_packed;
+        row[x].bg = g_bg_packed;
+    }
+}
+
+/* Записывает один символ в открытую (текущую) строку истории на позицию col. */
+static void hist_put(uint32_t col, char c) {
+    if (col >= MAX_COLS) return;
+    console_cell_t *row = g_history[hist_slot(g_total_lines)];
+    row[col].ch = c;
+    row[col].fg = g_fg_packed;
+    row[col].bg = g_bg_packed;
+}
+
+/* Закрывает текущую строку и открывает следующую (с чистого листа). */
+static void hist_new_line(void) {
+    g_total_lines++;
+    hist_clear_line(g_total_lines);
+}
+
+/* Рисует одну физическую строку экрана (screen_row, 0..g_rows-1) по данным
+ * логической строки истории. valid=0 — строки ещё не существовало (выше
+ * самой первой когда-либо напечатанной) или она уже была затёрта кольцом —
+ * рисуем просто фон. */
+static void render_history_row(uint32_t screen_row, uint64_t logical_line, int valid) {
+    uint32_t bg = g_bg_packed;
+    for (uint32_t x = 0; x < g_cols && x < MAX_COLS; x++) {
+        if (valid) {
+            console_cell_t *cell = &g_history[hist_slot(logical_line)][x];
+            draw_glyph_raw(x, screen_row, cell->ch, cell->fg, cell->bg);
+        } else {
+            draw_glyph_raw(x, screen_row, ' ', bg, bg);
+        }
+    }
+}
+
+/* Перерисовывает весь экран из истории с учётом g_scroll_offset. Вызывается
+ * только по факту скролла (PgUp/PgDn) — не на каждый символ, так что цена
+ * "перерисовать весь экран" тут не проблема (в отличие от scroll_if_needed,
+ * который остаётся быстрым memmove-путём для обычной живой печати). */
+static void console_redraw(void) {
+    int64_t base = (int64_t)g_screen_top - (int64_t)g_scroll_offset;
+    for (uint32_t r = 0; r < g_rows; r++) {
+        int64_t logical = base + (int64_t)r;
+        int valid = logical >= 0 && (uint64_t)logical <= g_total_lines &&
+                    (g_total_lines - (uint64_t)logical) < SCROLLBACK_LINES;
+        render_history_row(r, valid ? (uint64_t)logical : 0, valid);
+    }
+}
+
+void console_scroll(int32_t delta) {
+    if (g_fb == NULL) return;
+
+    int64_t new_offset = (int64_t)g_scroll_offset + delta;
+
+    uint64_t max_offset = g_total_lines;
+    if (max_offset > SCROLLBACK_LINES - 1) max_offset = SCROLLBACK_LINES - 1;
+
+    if (new_offset < 0) new_offset = 0;
+    if ((uint64_t)new_offset > max_offset) new_offset = (int64_t)max_offset;
+
+    if ((uint32_t)new_offset == g_scroll_offset) return; /* уже на границе, перерисовывать нечего */
+
+    console_cursor_hide();
+    g_scroll_offset = (uint32_t)new_offset;
+    console_redraw();
+    console_cursor_show();
+}
+
+uint32_t console_get_cols(void) {
+    return g_cols;
+}
+
+uint32_t console_get_rows(void) {
+    return g_rows;
+}
+
+static void scroll_if_needed(void) {
+    if (g_row < g_rows) return;
+
+    /* Сдвигаем всё содержимое framebuffer на одну строку текста вверх. */
+    uint32_t line_bytes = g_fb->pixels_per_scanline * 4;
+    uint8_t *base = (uint8_t *)(uintptr_t)g_fb->base;
+    uint32_t scroll_px = FONT_HEIGHT;
+
+    memmove(base, base + (uint64_t)scroll_px * line_bytes,
+            (uint64_t)(g_fb->height - scroll_px) * line_bytes);
+
+    uint32_t bg = g_bg_packed;
+    for (uint32_t y = g_fb->height - scroll_px; y < g_fb->height; y++) {
+        uint32_t *row = (uint32_t *)(base + (uint64_t)y * line_bytes);
+        for (uint32_t x = 0; x < g_fb->width; x++) row[x] = bg;
+    }
+
+    g_row = g_rows - 1;
+    g_screen_top++;
+}
+
+/* Переход на следующую строку экрана: в пакете только сдвигаем окно истории. */
+static void advance_row(void) {
+    if (g_row < g_rows) return;
+    if (g_batch) {
+        g_defer_draw = 1;
+        g_row = g_rows - 1;
+        g_screen_top++;
+    } else {
+        scroll_if_needed();
+    }
+}
+
+void console_capture_begin(char *buffer, uint32_t capacity) {
+    g_capture_buffer = buffer;
+    g_capture_capacity = capacity;
+    g_capture_length = 0;
+    g_capture_active = (buffer != NULL && capacity > 0);
+    if (g_capture_active) g_capture_buffer[0] = '\0';
+}
+
+uint32_t console_capture_end(void) {
+    uint32_t length = g_capture_length;
+    if (g_capture_active && g_capture_capacity > 0) {
+        uint32_t pos = length < g_capture_capacity ? length : g_capture_capacity - 1;
+        g_capture_buffer[pos] = '\0';
+    }
+    g_capture_active = 0;
+    g_capture_buffer = NULL;
+    g_capture_capacity = 0;
+    return length;
+}
+
+int console_capture_active(void) { return g_capture_active; }
+
+static void putchar_raw(char c) {
+    if (g_capture_active) {
+        if (g_capture_length + 1 < g_capture_capacity) {
+            g_capture_buffer[g_capture_length++] = c;
+            g_capture_buffer[g_capture_length] = '\0';
+        }
+        return;
+    }
+    /* Любая новая печать возвращает к живому виду — как в обычном
+     * терминале: набрал что-то во время просмотра истории — тебя
+     * вернуло вниз, к месту, где реально появляется новый текст. */
+    if (g_scroll_offset != 0) {
+        g_scroll_offset = 0;
+        console_redraw();
+    }
+
+    if (c == '\n') {
+        hist_new_line();
+        g_col = 0;
+        g_row++;
+        advance_row();
+        return;
+    }
+    if (c == '\r') {
+        g_col = 0;
+        return;
+    }
+    if (c == '\b') {
+        if (g_col > 0) {
+            g_col--;
+            if (!g_defer_draw) draw_glyph(g_col, g_row, ' ');
+            hist_put(g_col, ' ');
+        }
+        return;
+    }
+
+    if (!g_defer_draw) draw_glyph(g_col, g_row, c);
+    hist_put(g_col, c);
+    g_col++;
+    if (g_col >= g_cols) {
+        hist_new_line();
+        g_col = 0;
+        g_row++;
+        advance_row();
+    }
+}
+
+void console_batch_begin(void) {
+    if (g_batch == 0) console_cursor_hide();
+    g_batch++;
+}
+
+void console_flush(void) {
+    if (g_defer_draw) {
+        g_defer_draw = 0;
+        console_redraw();
+    }
+}
+
+void console_batch_end(void) {
+    if (g_batch == 0) return;
+    if (--g_batch == 0) {
+        console_flush();
+        console_cursor_show();
+    }
+}
+
+/* Конец пакета без перерисовки — если во время пакета экран занял кто-то
+ * другой (например, команда запустила GUI). */
+void console_batch_cancel(void) {
+    if (g_batch == 0) return;
+    if (--g_batch == 0) g_defer_draw = 0;
+}
+
+void console_putchar(char c) {
+    console_batch_begin();
+    putchar_raw(c);
+    console_batch_end();
+}
+
+void console_print(const char *s) {
+    console_batch_begin();
+    while (*s) putchar_raw(*s++);
+    console_batch_end();
+}
+
+/* Общая реализация console_status_ok()/_fail()/_warn(): дописывает
+ * пробелами текущую строку до правого края (g_cols - ширина статуса),
+ * затем печатает "[ LABEL ]" цветом color и переводит строку.
+ *
+ * Если то, что уже напечатано слева, само длиннее доступного места —
+ * никуда не подгоняем и не обрезаем, просто ставим статус сразу после
+ * текста (перенос строки консоль и так сделает сама, если нужно). */
+static void print_status(const char *label, uint32_t color) {
+    uint32_t label_len = 0;
+    while (label[label_len]) label_len++;
+
+    /* "[ " + label + " ]" */
+    uint32_t status_width = label_len + 4;
+    uint32_t target_col = (g_cols > status_width) ? (g_cols - status_width) : g_col;
+
+    uint32_t saved_fg = g_fg;
+    uint32_t saved_bg = g_bg;
+
+    if (g_col < target_col) {
+        console_set_color(saved_fg, saved_bg);
+        while (g_col < target_col) console_putchar(' ');
+    }
+
+    console_set_color(COLOR_WHITE, saved_bg);
+    console_putchar('[');
+    console_putchar(' ');
+    console_set_color(color, saved_bg);
+    console_print(label);
+    console_set_color(COLOR_WHITE, saved_bg);
+    console_putchar(' ');
+    console_putchar(']');
+    console_putchar('\n');
+
+    console_set_color(saved_fg, saved_bg);
+}
+
+void console_status_ok(void) {
+    print_status("OK", COLOR_GREEN);
+}
+
+void console_status_fail(void) {
+    print_status("FAIL", COLOR_RED);
+}
+
+void console_status_warn(void) {
+    print_status("WARN", COLOR_YELLOW);
+}
+
+void console_print_hex(uint64_t value) {
+    console_print("0x");
+    char buf[17];
+    const char *digits = "0123456789ABCDEF";
+    buf[16] = 0;
+    for (int i = 0; i < 16; i++) {
+        buf[15 - i] = digits[value & 0xF];
+        value >>= 4;
+    }
+    console_print(buf);
+}
+
+void console_component_status(const char *name, const char *type, const char *version, int ok) {
+    uint32_t saved_fg = g_fg;
+    uint32_t saved_bg = g_bg;
+    const char *safe_name = name ? name : "component";
+    const char *safe_type = type ? type : "service";
+    const char *safe_version = version ? version : "unknown";
+
+    console_set_color(COLOR_CYAN, saved_bg);
+    console_print(safe_name);
+    console_set_color(COLOR_WHITE, saved_bg);
+    console_putchar(' ');
+    console_print(safe_type);
+    console_putchar(' ');
+    console_print(safe_version);
+    console_putchar(' ');
+    console_print("[ ");
+    console_set_color(ok ? COLOR_GREEN : COLOR_RED, saved_bg);
+    console_print(ok ? " OK  " : " FAIL ");
+    console_set_color(COLOR_WHITE, saved_bg);
+    console_print("]");
+    console_putchar('\n');
+    console_set_color(saved_fg, saved_bg);
+}
+
+void console_print_dec(uint64_t value) {
+    char buf[21];
+    int i = 20;
+    buf[i--] = 0;
+    if (value == 0) {
+        buf[i--] = '0';
+    } else {
+        while (value > 0) {
+            buf[i--] = '0' + (value % 10);
+            value /= 10;
+        }
+    }
+    console_print(&buf[i + 1]);
+}
