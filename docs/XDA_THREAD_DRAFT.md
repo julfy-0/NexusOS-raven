@@ -27,8 +27,7 @@ NexusOS boots on bare metal without any Android runtime, Bionic, or Linux kernel
 
 ### ✅ What's Working:
 * **AArch64 Bootloader Handoff**: Standard `boot.img` (header v4). Automatic relocation, EL2 → EL1 switch, page tables (2MB granule identity map, Normal Cacheable + Non-Cacheable + Device MMIO).
-* **Display (DPU / DECON0)**: Native resolution **1440 x 3120** AMOLED scanning. Direct rendering into framebuffer, boot console log, custom mobile UI with interactive App Dock and 5-row Touch OSK (On-Screen Keyboard).
-* **Touchscreen (Samsung S6SY791 / SEC_TS)**: Full hardware communication over **SPI11 / USI11 (Mode 3, CPOL=1, CPHA=1)**. Multi-touch coordinate decoding (up to 10 points), visual touch ripple feedback.
+* **Display (DPU / DECON0)**: Native resolution **1440 x 3120** AMOLED scanning. Direct rendering into framebuffer, boot console log, custom mobile UI with interactive App Dock and On-Screen Keyboard.
 * **Storage (UFS 3.1 & GPT Scanner)**:
   * Hardware UFS 3.1 HCI driver @ `0x14700000`.
   * Block abstraction layer translating 512B sectors into native 4K UFS blocks.
@@ -41,6 +40,7 @@ NexusOS boots on bare metal without any Android runtime, Bionic, or Linux kernel
 * **Interrupt Controller (ARM GICv3)**: Distributor (`0x10400000`), CPU0 Redistributor (`0x10440000`), and AArch64 CPU Interface system registers configured.
 
 ### ⏳ Work In Progress / Not Working Yet:
+* **Touchscreen (Samsung S6SY791 / SEC_TS)**: SPI/GPIO initialization in progress, touch input does **not** work yet.
 * Wi-Fi & Bluetooth (Broadcom PCIe/UART)
 * Audio (DSP / Sliders)
 * Camera (Titan M2 / ISP)
@@ -81,8 +81,8 @@ NexusOS boots on bare metal without any Android runtime, Bionic, or Linux kernel
    ```
 2. **NexusOS will boot!**
    * You will see the colored hardware probing console (`[ OK ]`).
-   * The mobile UI (wallpaper, app dock, and touch on-screen keyboard) will appear.
-   * Tap the screen to test touch ripple feedback or press physical volume/power buttons.
+   * The mobile UI (wallpaper, app dock, and on-screen keyboard) will appear.
+   * Press physical volume or power buttons to see the on-screen HUD (touchscreen input is still WIP and not working yet).
 
 ---
 
@@ -106,8 +106,7 @@ git clone https://github.com/julfy-0/NexusOS-raven.git
 cd NexusOS-raven
 
 # Build standalone bootable boot.img for Pixel 6 Pro:
-make -f Makefile.pixel6pro clean
-make -f Makefile.pixel6pro -j$(nproc)
+./build.sh
 ```
 The resulting image will be generated at `build/pixel6pro/boot.img`.
 
@@ -115,7 +114,9 @@ The resulting image will be generated at `build/pixel6pro/boot.img`.
 
 ## 🔗 Sources & Credits
 
-* **GitHub Repository**: [julfy-0/NexusOS-raven](https://github.com/julfy-0/NexusOS-raven)
+* **Device Port Repository (raven)**: [julfy-0/NexusOS-raven](https://github.com/julfy-0/NexusOS-raven)
+* **Base / Upstream Operating System**: [julfy-0/NexusOS](https://github.com/julfy-0/NexusOS) *(NexusOS-raven is built upon and ported from the main NexusOS codebase)*
+* **How to Contribute**: [CONTRIBUTING.md](https://github.com/julfy-0/NexusOS-raven/blob/main/CONTRIBUTING.md) — PRs, driver reverse-engineering, and hardware testing are welcome!
 * **Author / Developer**: @julfy-0
 * **Platform Trees & References**: Google Android Open Source Project (`android-gs-raviole`), Linux upstream Exynos drivers.
 
